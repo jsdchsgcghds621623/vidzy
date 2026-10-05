@@ -5,7 +5,8 @@
   "main": "videasy.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node videasy.js"
+    "start": "node videasy.js",
+     "postinstall": "playwright install --with-deps chromium"
   },
   "keywords": [],
   "type": "commonjs",
