@@ -6,6 +6,7 @@
 //  TV    → https://player.vidzee.wtf/embed/tv/{tmdb}/{s}/{e}
 //  MOVIE → https://player.vidzee.wtf/embed/movie/{tmdb}
 //  Uses chromium-headless-shell — truly windowless binary, no flash
+//  m3u8 capture is status-verified: only 200 responses are accepted.
 // ═══════════════════════════════════════════════════════════════
 require('dotenv').config();
 
@@ -177,8 +178,8 @@ function banner() {
     '',
     `${C.cyan}  ╭─────────────────────────────────────────────────────────────╮${C.reset}`,
     `${C.cyan}  │${C.reset}  ${C.bold}🎬  vidzee.wtf stream proxy${C.reset}                              ${C.cyan}│${C.reset}`,
-    `${C.cyan}  │${C.reset}  ${C.gray}v2.2 · production grade · playwright + postgres${C.reset}             ${C.cyan}│${C.reset}`,
-    `${C.cyan}  │${C.reset}  ${C.gray}headless-shell · windowless · DB-first · no-click${C.reset}        ${C.cyan}│${C.reset}`,
+    `${C.cyan}  │${C.reset}  ${C.gray}v2.3 · production grade · playwright + postgres${C.reset}             ${C.cyan}│${C.reset}`,
+    `${C.cyan}  │${C.reset}  ${C.gray}headless-shell · windowless · DB-first · m3u8-200-only${C.reset}    ${C.cyan}│${C.reset}`,
     `${C.cyan}  ╰─────────────────────────────────────────────────────────────╯${C.reset}`,
     '',
   ];
@@ -649,6 +650,8 @@ async function acquirePage() {
 
 // ═══════════════════════════════════════════════════════════════
 //  CAPTURE  — pure network interception, NO clicking
+//  m3u8 acceptance rule: response status MUST be 200.
+//  3xx / 4xx / 5xx are ignored and we keep waiting for a 200.
 // ═══════════════════════════════════════════════════════════════
 const BLOCKED_TYPES = new Set(['image', 'font', 'media', 'manifest']);
 const BLOCKED_HOSTS = [
@@ -724,11 +727,16 @@ async function captureStream(mediaType, tmdb, s, e) {
   page.setDefaultTimeout(3000);
   page.setDefaultNavigationTimeout(5000);
 
-  let captured = null;          // full JSON payload if available
-  let capturedUrl = '';         // URL of the API response
-  let m3u8Url = null;           // extracted m3u8 URL (from JSON or direct request)
-  let apiResponded = false;
+  let captured         = null;   // JSON payload with no m3u8 expectation
+  let jsonPayload      = null;   // JSON payload that contained an m3u8 candidate
+  let capturedUrl      = '';
+  let m3u8Url          = null;   // verified 200 m3u8 URL
+  let apiResponded     = false;
   let apiReturnedEmpty = false;
+
+  const rejectedM3u8    = new Set();   // m3u8 URLs seen with non-200
+  const candidateM3u8   = new Set();   // m3u8 URLs extracted from JSON (awaiting verification)
+  const redirectTargets = new Map();   // redirect target URL -> original m3u8 URL
 
   let resolveCapture;
   const captureSignal = new Promise(r => { resolveCapture = r; });
@@ -748,48 +756,91 @@ async function captureStream(mediaType, tmdb, s, e) {
     if (!VIDZEE_API_MATCH.some(fragment => url.includes(fragment))) return;
 
     apiResponded = true;
-    if (captured || m3u8Url) return;
+    if (m3u8Url) return;
 
     try {
       const text = await res.text();
-      if (res.status() === 200 && text.trim().startsWith('{')) {
-        const json = JSON.parse(text);
+      if (res.status() !== 200 || !text.trim().startsWith('{')) return;
+      const json = JSON.parse(text);
 
-        // Try to extract m3u8 directly from JSON
-        const extracted = extractStreamFromJson(json);
-        if (extracted) {
-          m3u8Url = extracted;
-          captured = json;
-          capturedUrl = url;
-          log('ok', 'capture', 'm3u8 extracted from JSON', {
-            url: url.slice(0, 100),
-            m3u8: extracted.slice(0, 120),
-          });
-          resolveCapture(json);
-          return;
-        }
+      const extracted = extractStreamFromJson(json);
+      if (extracted) {
+        // Do NOT capture yet — the m3u8 might 302 or fail.
+        // Wait for a network response with status 200.
+        candidateM3u8.add(extracted);
+        if (!jsonPayload) jsonPayload = json;
+        log('info', 'capture', 'm3u8 candidate from JSON (awaiting 200)', {
+          url: url.slice(0, 100),
+          m3u8: extracted.slice(0, 120),
+        });
+        return;
+      }
 
-        // If JSON has sources but no m3u8 string yet, keep the JSON
-        if (json.sources || json.streams || json.data) {
-          captured = json;
-          capturedUrl = url;
-          log('ok', 'capture', 'JSON hit (no m3u8 yet)', { url: url.slice(0, 100) });
-          // don't resolve yet — a later response may carry the m3u8
-        } else {
-          apiReturnedEmpty = true;
-        }
+      if (!captured && (json.sources || json.streams || json.data)) {
+        captured    = json;
+        capturedUrl = url;
+        log('ok', 'capture', 'JSON hit (no m3u8 yet)', { url: url.slice(0, 100) });
+      } else if (!json.sources && !json.streams && !json.data) {
+        apiReturnedEmpty = true;
       }
     } catch {}
   });
 
-  // ── intercept direct .m3u8 requests ─────────────────────
+  // ── intercept .m3u8 network responses — ONLY accept 200 ──
   page.on('response', (res) => {
-    const url = res.url();
-    if (url.includes('.m3u8') && !m3u8Url) {
-      m3u8Url = url;
+    const url    = res.url();
+    const status = res.status();
+    if (m3u8Url) return;
+
+    // Track redirects originating from a known m3u8 / candidate
+    if (status >= 300 && status < 400) {
+      const loc = res.headers()['location'];
+      if (loc && (url.includes('.m3u8') || candidateM3u8.has(url))) {
+        try {
+          const abs = new URL(loc, url).href;
+          redirectTargets.set(abs, url);
+          log('debug', 'capture', 'm3u8 redirect tracked', {
+            from: url.slice(0, 100),
+            to:   abs.slice(0, 100),
+            status,
+          });
+        } catch {}
+      }
+      return;
+    }
+
+    const ct = (res.headers()['content-type'] || '').toLowerCase();
+    const looksLikeM3u8 =
+      url.includes('.m3u8') ||
+      ct.includes('mpegurl') ||
+      ct.includes('x-mpegurl') ||
+      redirectTargets.has(url);
+
+    if (!looksLikeM3u8) return;
+
+    if (status === 200) {
+      m3u8Url     = url;
       capturedUrl = url;
-      log('ok', 'capture', 'direct m3u8 intercepted', { url: url.slice(0, 160) });
+
+      const via =
+        candidateM3u8.has(url)   ? 'json-candidate' :
+        redirectTargets.has(url) ? 'json-candidate-redirect' :
+                                   'direct';
+
+      log('ok', 'capture', 'm3u8 200 intercepted', {
+        url: url.slice(0, 160),
+        status,
+        via,
+      });
       resolveCapture({ m3u8: url });
+    } else {
+      if (!rejectedM3u8.has(url)) {
+        rejectedM3u8.add(url);
+        log('info', 'capture', 'm3u8 non-200 — waiting for a 200', {
+          url: url.slice(0, 120),
+          status,
+        });
+      }
     }
   });
 
@@ -800,10 +851,10 @@ async function captureStream(mediaType, tmdb, s, e) {
 
   try {
     log('info', 'capture', 'start', {
-      type: mediaType,
-      key: `${tmdb}|${s}|${e}`,
+      type:   mediaType,
+      key:    `${tmdb}|${s}|${e}`,
       budget: `${CAPTURE_TIMEOUT}ms`,
-      url: embedUrl,
+      url:    embedUrl,
     });
 
     const gotoTimeout = Math.min(5000, Math.max(1000, remaining()));
@@ -816,16 +867,14 @@ async function captureStream(mediaType, tmdb, s, e) {
 
     if (remaining() <= 0) return notAvailable('timeout');
 
-    // Wait for the app to mount and fire its API request
     await Promise.race([
       page.waitForSelector('#root > *', { timeout: Math.min(2500, remaining()) }).catch(() => {}),
       captureSignal,
     ]);
 
-    // Give the network a moment to settle — no clicking needed
     await raceSleep(400);
 
-    // Poll until capture or deadline — just wait, never click
+    // Wait for a verified 200 m3u8 (or a JSON payload that has no m3u8 expected)
     while (!captured && !m3u8Url && remaining() > 0) {
       await raceSleep(300);
     }
@@ -838,18 +887,33 @@ async function captureStream(mediaType, tmdb, s, e) {
 
   // ── build result ────────────────────────────────────────
   if (m3u8Url) {
-    log('ok', 'capture', 'done (m3u8)', { took: `${took}ms`, m3u8: m3u8Url.slice(0, 120) });
+    log('ok', 'capture', 'done (m3u8 200)', {
+      took: `${took}ms`,
+      m3u8: m3u8Url.slice(0, 120),
+    });
     return {
       available: true,
-      data: captured || { m3u8: m3u8Url },
+      data: jsonPayload || captured || { m3u8: m3u8Url },
       m3u8: m3u8Url,
       from: capturedUrl,
     };
   }
 
   if (captured) {
-    log('ok', 'capture', 'done (json)', { took: `${took}ms` });
+    log('ok', 'capture', 'done (json, no m3u8)', { took: `${took}ms` });
     return { available: true, data: captured, m3u8: null, from: capturedUrl };
+  }
+
+  if (jsonPayload) {
+    // We had an m3u8 candidate from JSON but never saw a 200 for it.
+    log('warn', 'capture', 'm3u8 candidate never returned 200', {
+      took: `${took}ms`,
+      candidates: [...candidateM3u8].slice(0, 3).map(u => u.slice(0, 100)),
+    });
+    return notAvailable('m3u8_not_200', {
+      candidates: [...candidateM3u8],
+      rejected:   [...rejectedM3u8],
+    });
   }
 
   if (apiReturnedEmpty) {
@@ -894,11 +958,14 @@ async function resolveStream(mediaType, tmdb, s, e, key) {
     return { payload: body, source: 'capture', negative: true };
   }
 
+  // NOTE: spread cap.data first, then override with verified values.
+  // This ensures the verified (200-OK) m3u8 always wins over any
+  // unverified m3u8 that may have been present in the JSON payload.
   const payload = {
+    ...(cap.data || {}),
     available: true,
     type: mediaType,
-    m3u8: cap.m3u8 || null,          // ← top-level m3u8 for easy consumption
-    ...cap.data,
+    m3u8: cap.m3u8 || null,          // ← verified 200 URL or null
   };
   cache.set(key, payload, CACHE_TTL);
   saveToDb(mediaType, tmdb, s, e, payload).catch(() => {});
